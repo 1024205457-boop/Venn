@@ -18,8 +18,8 @@ export interface VennData {
   relations: VennRelation[];
 }
 
-const ZHIPU_API_KEY = process.env.ZHIPU_API_KEY || "";
-const ZHIPU_MODEL = process.env.ZHIPU_MODEL || "glm-4-flash";
+const ZHIPU_API_KEY = process.env.ZHIPU_API_KEY || process.env.zhipu_api_key || "";
+const ZHIPU_MODEL = process.env.ZHIPU_MODEL || process.env.zhipu_model || "glm-4-flash";
 
 export async function analyzeConcepts(text: string): Promise<VennData> {
   const prompt = `你是一个概念分析引擎。根据以下文档/文本，提取关键概念及其层级关系，组织成嵌套维恩图结构。
