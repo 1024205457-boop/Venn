@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { analyzeConcepts } from "@/lib/bedrock";
+import { analyzeConcepts } from "@/lib/zhipu";
 
 export async function POST(request: NextRequest) {
   try {
