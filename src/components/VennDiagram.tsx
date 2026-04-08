@@ -2,35 +2,27 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import * as d3 from "d3";
-
-interface VennNode {
-  id: string;
-  label: string;
-  description?: string;
-  children?: VennNode[];
-}
-
-interface VennRelation {
-  sets: string[];
-  label?: string;
-  sharedConcepts: string[];
-}
-
-interface VennData {
-  title?: string;
-  summary?: string;
-  nodes: VennNode[];
-  relations: VennRelation[];
-}
+import type { VennNode, VennRelation, VennData } from "@/types/venn";
+import { estimateNodeDensity, densityLevel } from "@/types/venn";
 
 interface Props {
   data: VennData;
+  onDataChange?: (data: VennData) => void;
+  onDeepAnalyze?: (nodeId: string, text: string) => Promise<void>;
+  deepAnalyzing?: boolean;
+  onOpenWiki?: (nodeId: string) => void;
 }
 
 interface SelectionInfo {
   node: VennNode;
   parentNode?: VennNode;
   colorIndex: number;
+  // For intersection selections
+  relation?: VennRelation;
+  nodeA?: VennNode;
+  nodeB?: VennNode;
+  colorIndexA?: number;
+  colorIndexB?: number;
 }
 
 const FILLS = [
@@ -125,13 +117,74 @@ function lensPath(
   ].join(" ");
 }
 
-export default function VennDiagram({ data }: Props) {
+export default function VennDiagram({ data, onDataChange, onDeepAnalyze, deepAnalyzing, onOpenWiki }: Props) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [showBorders, setShowBorders] = useState(false);
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
-  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [editingField, setEditingField] = useState<"label" | "description" | null>(null);
+  const [editValue, setEditValue] = useState("");
+  const [deepInput, setDeepInput] = useState<string | null>(null); // null = collapsed
+  const deepFileRef = useRef<HTMLInputElement>(null);
   const zoomedInRef = useRef(false);
+  const savedTransformRef = useRef<d3.ZoomTransform | null>(null);
+
+  // Deep clone and update a node in the tree
+  function updateNodeInTree(nodes: VennNode[], nodeId: string, updater: (node: VennNode) => VennNode): VennNode[] {
+    return nodes.map((n) => {
+      if (n.id === nodeId) return updater({ ...n });
+      if (n.children && n.children.length > 0) {
+        return { ...n, children: updateNodeInTree(n.children, nodeId, updater) };
+      }
+      return n;
+    });
+  }
+
+  function removeNodeFromTree(nodes: VennNode[], nodeId: string): VennNode[] {
+    return nodes
+      .filter((n) => n.id !== nodeId)
+      .map((n) => {
+        if (n.children && n.children.length > 0) {
+          return { ...n, children: removeNodeFromTree(n.children, nodeId) };
+        }
+        return n;
+      });
+  }
+
+  function handleEditSave() {
+    if (!selection || !editingField || !onDataChange) return;
+    const newNodes = updateNodeInTree(data.nodes, selection.node.id, (node) => ({
+      ...node,
+      [editingField]: editValue,
+    }));
+    onDataChange({ ...data, nodes: newNodes });
+    // Update selection to reflect changes
+    setSelection({ ...selection, node: { ...selection.node, [editingField]: editValue } });
+    setEditingField(null);
+  }
+
+  function handleAddChild() {
+    if (!selection || !onDataChange) return;
+    const newId = selection.node.id + "_child_" + Date.now();
+    const newChild: VennNode = { id: newId, label: "新概念", description: "", children: [] };
+    const newNodes = updateNodeInTree(data.nodes, selection.node.id, (node) => ({
+      ...node,
+      children: [...(node.children || []), newChild],
+    }));
+    onDataChange({ ...data, nodes: newNodes });
+    // Update selection
+    const updatedNode = { ...selection.node, children: [...(selection.node.children || []), newChild] };
+    setSelection({ ...selection, node: updatedNode });
+  }
+
+  function handleDeleteNode() {
+    if (!selection || !onDataChange) return;
+    const newNodes = removeNodeFromTree(data.nodes, selection.node.id);
+    // Also clean up relations referencing this node
+    const newRelations = data.relations.filter((r) => !r.sets.includes(selection.node.id));
+    onDataChange({ ...data, nodes: newNodes, relations: newRelations });
+    setSelection(null);
+  }
 
   const render = useCallback(() => {
     if (!svgRef.current || !containerRef.current || !data) return;
@@ -187,6 +240,7 @@ export default function VennDiagram({ data }: Props) {
       .on("zoom", (event) => {
         g.attr("transform", event.transform);
         currentScale = event.transform.k;
+        savedTransformRef.current = event.transform;
         updateVisibility();
       });
 
@@ -210,42 +264,60 @@ export default function VennDiagram({ data }: Props) {
           relatedPairs.add([rel.sets[a], rel.sets[b]].sort().join("|"));
     });
 
-    // First pass: compute radii
+    // First pass: compute radii — smaller when more nodes to avoid overcrowding
     const totalWeight = data.nodes.reduce((s, n) => s + countDescendants(n), 0);
+    const sizeScale = nodeCount <= 3 ? 1 : 0.75;
     const radii = data.nodes.map((node) => {
       const weight = countDescendants(node);
-      return baseRadius * 0.5 + baseRadius * 0.3 * (weight / totalWeight) * nodeCount;
+      return (baseRadius * 0.5 + baseRadius * 0.3 * (weight / totalWeight) * nodeCount) * sizeScale;
     });
 
-    // Determine spread so that ALL related pairs geometrically overlap
-    // For pairs at angle θ apart, distance = 2*spread*sin(θ/2)
-    // Need distance < r1 + r2 for overlap → spread < (r1+r2) / (2*sin(θ/2))
-    let spread = nodeCount <= 2 ? baseRadius * 0.7 : baseRadius * 0.85;
-    data.relations.forEach((rel) => {
-      for (let a = 0; a < rel.sets.length; a++) {
-        for (let b = a + 1; b < rel.sets.length; b++) {
-          const idxA = data.nodes.findIndex(n => n.id === rel.sets[a]);
-          const idxB = data.nodes.findIndex(n => n.id === rel.sets[b]);
-          if (idxA < 0 || idxB < 0) continue;
-          const angleA = (2 * Math.PI * idxA) / nodeCount - Math.PI / 2;
-          const angleB = (2 * Math.PI * idxB) / nodeCount - Math.PI / 2;
-          const halfAngle = Math.abs(angleB - angleA) / 2;
-          const sinHalf = Math.sin(halfAngle) || 0.01;
-          const rSum = radii[idxA] + radii[idxB];
-          // Need 2*spread*sinHalf < rSum * 0.85 (0.85 to ensure visible overlap)
-          const maxSpread = (rSum * 0.85) / (2 * sinHalf);
-          spread = Math.min(spread, maxSpread);
-        }
-      }
-    });
-
+    // Position nodes
     const topPositions: NodePos[] = [];
-    data.nodes.forEach((node, i) => {
-      const angle = (2 * Math.PI * i) / nodeCount - Math.PI / 2;
-      const x = cx + Math.cos(angle) * spread;
-      const y = cy + Math.sin(angle) * spread;
-      topPositions.push({ id: node.id, x, y, r: radii[i], node, colorIndex: i });
-    });
+
+    if (nodeCount === 4) {
+      // 4 nodes: 2x2 grid layout for better overlap visibility
+      const avgR = radii.reduce((a, b) => a + b, 0) / 4;
+      const gap = avgR * 0.65; // overlap amount
+      const offX = avgR - gap / 2;
+      const offY = avgR - gap / 2;
+      const gridPos = [
+        { x: cx - offX, y: cy - offY }, // top-left
+        { x: cx + offX, y: cy - offY }, // top-right
+        { x: cx - offX, y: cy + offY }, // bottom-left
+        { x: cx + offX, y: cy + offY }, // bottom-right
+      ];
+      data.nodes.forEach((node, i) => {
+        topPositions.push({ id: node.id, x: gridPos[i].x, y: gridPos[i].y, r: radii[i], node, colorIndex: i });
+      });
+    } else {
+      // 2, 3, 5 nodes: circular layout
+      // Determine spread so that ALL related pairs geometrically overlap
+      let spread = nodeCount <= 2 ? baseRadius * 0.7 : baseRadius * 0.85;
+      data.relations.forEach((rel) => {
+        for (let a = 0; a < rel.sets.length; a++) {
+          for (let b = a + 1; b < rel.sets.length; b++) {
+            const idxA = data.nodes.findIndex(n => n.id === rel.sets[a]);
+            const idxB = data.nodes.findIndex(n => n.id === rel.sets[b]);
+            if (idxA < 0 || idxB < 0) continue;
+            const angleA = (2 * Math.PI * idxA) / nodeCount - Math.PI / 2;
+            const angleB = (2 * Math.PI * idxB) / nodeCount - Math.PI / 2;
+            const halfAngle = Math.abs(angleB - angleA) / 2;
+            const sinHalf = Math.sin(halfAngle) || 0.01;
+            const rSum = radii[idxA] + radii[idxB];
+            const maxSpread = (rSum * 0.85) / (2 * sinHalf);
+            spread = Math.min(spread, maxSpread);
+          }
+        }
+      });
+
+      data.nodes.forEach((node, i) => {
+        const angle = (2 * Math.PI * i) / nodeCount - Math.PI / 2;
+        const x = cx + Math.cos(angle) * spread;
+        const y = cy + Math.sin(angle) * spread;
+        topPositions.push({ id: node.id, x, y, r: radii[i], node, colorIndex: i });
+      });
+    }
 
     const relationMap = new Map<string, VennRelation>();
     data.relations.forEach((rel) => {
@@ -290,7 +362,17 @@ export default function VennDiagram({ data }: Props) {
       let childGroup: d3.Selection<SVGGElement, unknown, null, undefined> | null = null;
       let childCenter: { x: number; y: number; spread: number } | null = null;
 
-      if (node.children && node.children.length > 0) {
+      // Collapsed indicator
+      if (node.collapsed && node.children && node.children.length > 0) {
+        group.append("text")
+          .attr("x", x).attr("y", y + r * 0.3)
+          .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+          .attr("fill", TEXT_COLORS[ci]).attr("font-size", "10px").attr("opacity", 0.5)
+          .attr("pointer-events", "none")
+          .text(`+${node.children.length} 已折叠`);
+      }
+
+      if (node.children && node.children.length > 0 && !node.collapsed) {
         const childCount = node.children.length;
         const [ch, cs, cl] = HSL_VALUES[ci];
 
@@ -449,7 +531,7 @@ export default function VennDiagram({ data }: Props) {
 
           // Level 2: lighter fill, more saturation contrast
           const childFill = `hsl(${ch}, ${Math.max(cs - 15, 20)}%, ${cl + 18}%)`;
-          const hasGC = child.children && child.children.length > 0;
+          const hasGC = child.children && child.children.length > 0 && !child.collapsed;
           childCircleG.append("circle")
             .attr("cx", childX).attr("cy", childY).attr("r", thisChildR)
             .attr("fill", childFill)
@@ -457,7 +539,9 @@ export default function VennDiagram({ data }: Props) {
             .attr("stroke-dasharray", showBorders ? "4,2" : "none")
             .style("transition", "stroke-width 0.2s");
 
-          const childFontSize = showBorders ? (hasGC ? "10px" : "8px") : "8px";
+          // Dynamic font size: scale with circle radius, clamp to reasonable range
+          const baseFontSize = showBorders ? (hasGC ? Math.min(10, thisChildR * 0.35) : Math.min(8, thisChildR * 0.5)) : Math.min(8, thisChildR * 0.6);
+          const childFontSize = Math.max(4, baseFontSize) + "px";
           // In borders mode: if no grandchildren, label goes inside ellipse; if has grandchildren, label goes above circle
           const childLabelY = showBorders ? (hasGC ? childY - thisChildR - 4 : childY) : childY;
           const childLabel = childCircleG.append("text")
@@ -559,7 +643,7 @@ export default function VennDiagram({ data }: Props) {
                 .attr("stroke", STROKES[ci]).attr("stroke-width", showBorders ? 1 : 0.5)
                 .attr("stroke-dasharray", showBorders ? "2,1" : "none");
 
-              const gcFontSize = showBorders ? Math.min(7, gcR * 0.8) + "px" : "4px";
+              const gcFontSize = showBorders ? Math.max(3, Math.min(7, gcR * 0.7)) + "px" : Math.max(3, Math.min(4, gcR * 0.6)) + "px";
               gcCircleG.append("text")
                 .attr("x", gcX).attr("y", gcY)
                 .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
@@ -574,6 +658,54 @@ export default function VennDiagram({ data }: Props) {
               });
             });
 
+            // "+" add circle for grandchildren
+            if (onDataChange && gcPositions.length > 0) {
+              const lastGcPos = gcPositions[gcPositions.length - 1];
+              const addGcR = gcR;
+              const addGcX = lastGcPos.cx + gcR + addGcR + 2;
+              const addGcY = lastGcPos.cy;
+              const addGcG = gcGroup.append("g").style("cursor", "pointer").attr("class", "add-child-btn");
+              // Invisible larger hit area
+              addGcG.append("circle")
+                .attr("cx", addGcX).attr("cy", addGcY).attr("r", addGcR * 1.3)
+                .attr("fill", "transparent").attr("stroke", "none");
+              addGcG.append("circle")
+                .attr("cx", addGcX).attr("cy", addGcY).attr("r", addGcR)
+                .attr("fill", FILLS[ci]).attr("fill-opacity", 0.2)
+                .attr("stroke", STROKES[ci]).attr("stroke-width", 1)
+                .attr("stroke-dasharray", "3,2")
+                .attr("class", "add-btn-visible");
+              addGcG.append("text")
+                .attr("x", addGcX).attr("y", addGcY)
+                .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+                .attr("fill", TEXT_COLORS[ci]).attr("font-size", addGcR * 0.8 + "px").attr("opacity", 0.6)
+                .attr("pointer-events", "none")
+                .attr("class", "add-btn-text")
+                .text("+");
+              addGcG.on("mouseenter", () => {
+                addGcG.select(".add-btn-visible").attr("fill-opacity", 0.4).attr("stroke-width", 1.5);
+                addGcG.select(".add-btn-text").attr("opacity", 1);
+              });
+              addGcG.on("mouseleave", () => {
+                addGcG.select(".add-btn-visible").attr("fill-opacity", 0.2).attr("stroke-width", 1);
+                addGcG.select(".add-btn-text").attr("opacity", 0.6);
+              });
+              const childId = child.id;
+              addGcG.on("click", (event) => {
+                event.stopPropagation();
+                const newId = childId + "_gc_" + Date.now();
+                const newGc: VennNode = { id: newId, label: "新概念", description: "", children: [] };
+                function addGcInTree(nodes: VennNode[]): VennNode[] {
+                  return nodes.map((n) => {
+                    if (n.id === childId) return { ...n, children: [...(n.children || []), newGc] };
+                    if (n.children) return { ...n, children: addGcInTree(n.children) };
+                    return n;
+                  });
+                }
+                onDataChange({ ...data, nodes: addGcInTree(data.nodes) });
+              });
+            }
+
             // Grandchild center for zoom
             let gcSumX = 0, gcSumY = 0, gcMaxDist = 0;
             gcPositions.forEach(({ cx: px, cy: py }) => {
@@ -585,6 +717,62 @@ export default function VennDiagram({ data }: Props) {
               group: gcGroup,
               label: childLabel,
               center: { x: gcSumX / gcCount, y: gcSumY / gcCount, spread: Math.max(gcMaxDist, gcR * 2) },
+            });
+          } else if (onDataChange) {
+            // Leaf child node (no grandchildren yet) — show a "+" circle to allow adding grandchildren
+            // Use same sizing as would-be grandchild circles for consistency when zoomed in
+            const leafGcR = showBorders
+              ? Math.max(thisChildR * 0.35, childR * 0.18)
+              : Math.max(thisChildR * 0.4, childR * 0.25);
+            const leafAddX = childX;
+            const leafAddY = childY + (showBorders ? thisChildR * 0.15 : 0);
+            const leafGcGroup = childCircleG.append("g").attr("opacity", showBorders ? 1 : 0);
+            const leafAddG = leafGcGroup.append("g").style("cursor", "pointer").attr("class", "add-child-btn");
+            // Invisible larger hit area
+            leafAddG.append("circle")
+              .attr("cx", leafAddX).attr("cy", leafAddY).attr("r", leafGcR * 1.3)
+              .attr("fill", "transparent").attr("stroke", "none");
+            leafAddG.append("circle")
+              .attr("cx", leafAddX).attr("cy", leafAddY).attr("r", leafGcR)
+              .attr("fill", FILLS[ci]).attr("fill-opacity", 0.2)
+              .attr("stroke", STROKES[ci]).attr("stroke-width", 1)
+              .attr("stroke-dasharray", "3,2")
+              .attr("class", "add-btn-visible");
+            leafAddG.append("text")
+              .attr("x", leafAddX).attr("y", leafAddY)
+              .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+              .attr("fill", TEXT_COLORS[ci]).attr("font-size", leafGcR * 0.8 + "px").attr("opacity", 0.6)
+              .attr("pointer-events", "none")
+              .attr("class", "add-btn-text")
+              .text("+");
+            leafAddG.on("mouseenter", () => {
+              leafAddG.select(".add-btn-visible").attr("fill-opacity", 0.4).attr("stroke-width", 1.5);
+              leafAddG.select(".add-btn-text").attr("opacity", 1);
+            });
+            leafAddG.on("mouseleave", () => {
+              leafAddG.select(".add-btn-visible").attr("fill-opacity", 0.2).attr("stroke-width", 1);
+              leafAddG.select(".add-btn-text").attr("opacity", 0.6);
+            });
+            const leafChildId = child.id;
+            leafAddG.on("click", (event) => {
+              event.stopPropagation();
+              const newId = leafChildId + "_gc_" + Date.now();
+              const newGc: VennNode = { id: newId, label: "新概念", description: "", children: [] };
+              function addGcInTree(nodes: VennNode[]): VennNode[] {
+                return nodes.map((n) => {
+                  if (n.id === leafChildId) return { ...n, children: [...(n.children || []), newGc] };
+                  if (n.children) return { ...n, children: addGcInTree(n.children) };
+                  return n;
+                });
+              }
+              onDataChange({ ...data, nodes: addGcInTree(data.nodes) });
+            });
+
+            // Register as grandchild group for visibility toggling + double-click zoom target
+            grandchildMap.set(child.id, {
+              group: leafGcGroup,
+              label: childLabel,
+              center: { x: leafAddX, y: leafAddY, spread: leafGcR * 2 },
             });
           }
 
@@ -613,15 +801,126 @@ export default function VennDiagram({ data }: Props) {
           });
         });
 
-        // Child center for zoom
-        let sumX = 0, sumY = 0, maxDist = 0;
+        // "+" add circle next to last child
+        if (onDataChange) {
+          const lastPos = positions[positions.length - 1];
+          const lastR = lastPos.leafR || childR;
+          const addR = lastR;
+          // Place to the right of the last child
+          const addX = lastPos.cx + lastR + addR + 4;
+          const addY = lastPos.cy;
+          const addG = childGroup!.append("g").style("cursor", "pointer").attr("class", "add-child-btn");
+          // Invisible larger hit area
+          addG.append("circle")
+            .attr("cx", addX).attr("cy", addY).attr("r", addR * 1.3)
+            .attr("fill", "transparent").attr("stroke", "none");
+          addG.append("circle")
+            .attr("cx", addX).attr("cy", addY).attr("r", addR)
+            .attr("fill", FILLS[ci]).attr("fill-opacity", 0.3)
+            .attr("stroke", STROKES[ci]).attr("stroke-width", 1.5)
+            .attr("stroke-dasharray", "4,3")
+            .attr("class", "add-btn-visible");
+          addG.append("text")
+            .attr("x", addX).attr("y", addY)
+            .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+            .attr("fill", TEXT_COLORS[ci]).attr("font-size", addR * 0.8 + "px").attr("opacity", 0.7)
+            .attr("pointer-events", "none")
+            .attr("class", "add-btn-text")
+            .text("+");
+          addG.on("mouseenter", () => {
+            addG.select(".add-btn-visible").attr("fill-opacity", 0.5).attr("stroke-width", 2);
+            addG.select(".add-btn-text").attr("opacity", 1);
+          });
+          addG.on("mouseleave", () => {
+            addG.select(".add-btn-visible").attr("fill-opacity", 0.3).attr("stroke-width", 1.5);
+            addG.select(".add-btn-text").attr("opacity", 0.7);
+          });
+          addG.on("click", (event) => {
+            event.stopPropagation();
+            const newId = id + "_child_" + Date.now();
+            const newChild: VennNode = { id: newId, label: "新概念", description: "", children: [] };
+            const newNodes = data.nodes.map((n) => {
+              if (n.id === id) return { ...n, children: [...(n.children || []), newChild] };
+              // Check children recursively
+              function addInChildren(nodes: VennNode[]): VennNode[] {
+                return nodes.map((c) => {
+                  if (c.id === id) return { ...c, children: [...(c.children || []), newChild] };
+                  if (c.children) return { ...c, children: addInChildren(c.children) };
+                  return c;
+                });
+              }
+              if (n.children) return { ...n, children: addInChildren(n.children) };
+              return n;
+            });
+            onDataChange({ ...data, nodes: newNodes });
+          });
+        }
+
+        // Child center for zoom — include the "+" button position
+        const lastPos = positions[positions.length - 1];
+        const lastR = lastPos.leafR || childR;
+        const addBtnR = lastR;
+        const addBtnX = lastPos.cx + lastR + addBtnR + 4;
+        const addBtnY = lastPos.cy;
+        // Compute center including all children + "+" button
+        let sumX = addBtnX, sumY = addBtnY;
+        positions.forEach((p) => { sumX += p.cx; sumY += p.cy; });
+        const centerX = sumX / (childCount + 1);
+        const centerY = sumY / (childCount + 1);
+        // Compute max distance from center to any element edge
+        let maxDist = 0;
         positions.forEach((p) => {
-          sumX += p.cx; sumY += p.cy;
           const cr = p.leafR || childR;
-          const d = Math.sqrt((p.cx - x) ** 2 + (p.cy - y) ** 2) + cr;
+          const d = Math.sqrt((p.cx - centerX) ** 2 + (p.cy - centerY) ** 2) + cr;
           if (d > maxDist) maxDist = d;
         });
-        childCenter = { x: sumX / childCount, y: sumY / childCount, spread: maxDist };
+        // "+" button edge distance from center
+        const addDist = Math.sqrt((addBtnX - centerX) ** 2 + (addBtnY - centerY) ** 2) + addBtnR;
+        if (addDist > maxDist) maxDist = addDist;
+        childCenter = { x: centerX, y: centerY, spread: maxDist };
+      } else if (onDataChange) {
+        // Top-level node with no children — show a "+" circle inside to allow adding first child
+        const topLeafR = r * 0.2;
+        const topLeafX = x;
+        const topLeafY = y + r * 0.15;
+        childGroup = group.append("g").attr("opacity", showBorders ? 1 : 0);
+        const topLeafAddG = childGroup.append("g").style("cursor", "pointer").attr("class", "add-child-btn");
+        topLeafAddG.append("circle")
+          .attr("cx", topLeafX).attr("cy", topLeafY).attr("r", topLeafR * 1.3)
+          .attr("fill", "transparent").attr("stroke", "none");
+        topLeafAddG.append("circle")
+          .attr("cx", topLeafX).attr("cy", topLeafY).attr("r", topLeafR)
+          .attr("fill", FILLS[ci]).attr("fill-opacity", 0.25)
+          .attr("stroke", STROKES[ci]).attr("stroke-width", 1.5)
+          .attr("stroke-dasharray", "4,3")
+          .attr("class", "add-btn-visible");
+        topLeafAddG.append("text")
+          .attr("x", topLeafX).attr("y", topLeafY)
+          .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+          .attr("fill", TEXT_COLORS[ci]).attr("font-size", topLeafR * 0.8 + "px").attr("opacity", 0.7)
+          .attr("pointer-events", "none")
+          .attr("class", "add-btn-text")
+          .text("+");
+        topLeafAddG.on("mouseenter", () => {
+          topLeafAddG.select(".add-btn-visible").attr("fill-opacity", 0.45).attr("stroke-width", 2);
+          topLeafAddG.select(".add-btn-text").attr("opacity", 1);
+        });
+        topLeafAddG.on("mouseleave", () => {
+          topLeafAddG.select(".add-btn-visible").attr("fill-opacity", 0.25).attr("stroke-width", 1.5);
+          topLeafAddG.select(".add-btn-text").attr("opacity", 0.7);
+        });
+        const topNodeId = id;
+        topLeafAddG.on("click", (event) => {
+          event.stopPropagation();
+          const newId = topNodeId + "_child_" + Date.now();
+          const newChild: VennNode = { id: newId, label: "新概念", description: "", children: [] };
+          const newNodes = data.nodes.map((n) => {
+            if (n.id === topNodeId) return { ...n, children: [...(n.children || []), newChild] };
+            return n;
+          });
+          onDataChange({ ...data, nodes: newNodes });
+        });
+        childCenter = { x: topLeafX, y: topLeafY, spread: topLeafR * 2 };
       }
 
       const hasNestedChildren = showBorders && node.children && node.children.length > 0;
@@ -807,7 +1106,10 @@ export default function VennDiagram({ data }: Props) {
       });
     }
 
-    // ── Intersection lenses ──
+    // Layer for concept circles inside lenses (rendered above triple intersection)
+    const lensConceptOverlay = lensLayer.append("g");
+
+    // ── Intersection lenses (2-circle) ──
     for (let a = 0; a < topPositions.length; a++) {
       for (let b = a + 1; b < topPositions.length; b++) {
         const p1 = topPositions[a]; const p2 = topPositions[b];
@@ -851,7 +1153,29 @@ export default function VennDiagram({ data }: Props) {
           const conceptR = Math.min(maxTotalLen / (n * 2.8), 14);
           const conceptGap = conceptR * 0.8;
           const totalLen = n * conceptR * 2 + (n - 1) * conceptGap;
-          const startOffset = -totalLen / 2 + conceptR;
+
+          // Check if a third circle creates a triple intersection — if so, shift concepts away from center
+          let shiftAlong = 0;
+          for (let t = 0; t < topPositions.length; t++) {
+            if (t === a || t === b) continue;
+            const p3 = topPositions[t];
+            // Check if p3 overlaps with both p1 and p2
+            const d13 = Math.sqrt((p1.x - p3.x) ** 2 + (p1.y - p3.y) ** 2);
+            const d23 = Math.sqrt((p2.x - p3.x) ** 2 + (p2.y - p3.y) ** 2);
+            if (d13 < p1.r + p3.r && d23 < p2.r + p3.r) {
+              // Triple intersection exists — compute centroid of the 3 circles
+              const triCx = (p1.x + p2.x + p3.x) / 3;
+              const triCy = (p1.y + p2.y + p3.y) / 3;
+              // Project triple center onto lens long axis (relative to lens center)
+              const triProj = (triCx - lensCenterX) * longX + (triCy - lensCenterY) * longY;
+              // Shift concepts in the opposite direction along long axis
+              const shiftMag = Math.max(conceptR * 2, hh * 0.35);
+              shiftAlong = triProj > 0 ? -shiftMag : shiftMag;
+              break;
+            }
+          }
+
+          const startOffset = -totalLen / 2 + conceptR + shiftAlong;
 
           let slotIdx = 0;
 
@@ -862,45 +1186,94 @@ export default function VennDiagram({ data }: Props) {
             const outLen = Math.sqrt(outDx * outDx + outDy * outDy) || 1;
             const outNx = outDx / outLen;
             const outNy = outDy / outLen;
-            // Place label outside lens along outward direction
-            const labelDist = Math.min(p1.r, p2.r) * 0.45;
+            // Place label outside lens along outward direction, beyond concept circles
+            const labelDist = Math.min(p1.r, p2.r) * 0.65;
             const llX = lensCenterX + outNx * labelDist;
             const llY = lensCenterY + outNy * labelDist;
             lensG.append("text")
               .attr("x", llX).attr("y", llY)
               .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
               .attr("fill", mixedTextColor)
-              .attr("font-size", "11px").attr("font-weight", "700")
+              .attr("font-size", "12px").attr("font-weight", "700")
               .attr("pointer-events", "none")
-              .attr("opacity", 0.9)
-              .attr("stroke", mixedFill).attr("stroke-width", 2.5).attr("paint-order", "stroke")
+              .attr("stroke", mixedFill).attr("stroke-width", 3).attr("paint-order", "stroke")
               .text(labelText);
           }
 
           // Concept sub-circles along remaining slots
-          if (n > 0) {
-            const conceptGroup = lensG.append("g")
+          {
+            const conceptGroup = lensConceptOverlay.append("g")
               .attr("opacity", showBorders ? 1 : 0)
               .attr("class", "lens-concepts");
 
+            const actualConceptR = n > 0 ? conceptR : Math.min(maxTotalLen / 2.8, 14);
+
             concepts.forEach((concept) => {
-              const cOff = startOffset + slotIdx * (conceptR * 2 + conceptGap);
+              const cOff = startOffset + slotIdx * (actualConceptR * 2 + conceptGap);
               const ccx = lensCenterX + longX * cOff;
               const ccy = lensCenterY + longY * cOff;
 
               conceptGroup.append("circle")
-                .attr("cx", ccx).attr("cy", ccy).attr("r", conceptR)
+                .attr("cx", ccx).attr("cy", ccy).attr("r", actualConceptR)
                 .attr("fill", mixedFill).attr("stroke", mixedTextColor)
-                .attr("stroke-width", 0.8).attr("opacity", 0.7);
+                .attr("stroke-width", 1).attr("opacity", 0.9);
               conceptGroup.append("text")
                 .attr("x", ccx).attr("y", ccy)
                 .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
                 .attr("fill", mixedTextColor)
-                .attr("font-size", Math.min(9, conceptR * 0.8) + "px").attr("font-weight", "600")
+                .attr("font-size", Math.min(10, actualConceptR * 0.85) + "px").attr("font-weight", "700")
                 .attr("pointer-events", "none")
                 .text(concept);
               slotIdx++;
             });
+
+            // "+" add circle for intersection shared concepts
+            if (onDataChange) {
+              const addConceptOff = n > 0
+                ? startOffset + slotIdx * (actualConceptR * 2 + conceptGap)
+                : 0;
+              const addCx = lensCenterX + longX * addConceptOff;
+              const addCy = lensCenterY + longY * addConceptOff;
+              const addR = actualConceptR;
+              const lensAddG = conceptGroup.append("g").style("cursor", "pointer").attr("class", "add-child-btn");
+              lensAddG.append("circle")
+                .attr("cx", addCx).attr("cy", addCy).attr("r", addR * 1.3)
+                .attr("fill", "transparent").attr("stroke", "none");
+              lensAddG.append("circle")
+                .attr("cx", addCx).attr("cy", addCy).attr("r", addR)
+                .attr("fill", mixedFill).attr("fill-opacity", 0.25)
+                .attr("stroke", mixedTextColor).attr("stroke-width", 1)
+                .attr("stroke-dasharray", "3,2")
+                .attr("class", "add-btn-visible");
+              lensAddG.append("text")
+                .attr("x", addCx).attr("y", addCy)
+                .attr("text-anchor", "middle").attr("dominant-baseline", "middle")
+                .attr("fill", mixedTextColor).attr("font-size", addR * 0.8 + "px").attr("opacity", 0.6)
+                .attr("pointer-events", "none")
+                .attr("class", "add-btn-text")
+                .text("+");
+              lensAddG.on("mouseenter", () => {
+                lensAddG.select(".add-btn-visible").attr("fill-opacity", 0.45).attr("stroke-width", 1.5);
+                lensAddG.select(".add-btn-text").attr("opacity", 1);
+              });
+              lensAddG.on("mouseleave", () => {
+                lensAddG.select(".add-btn-visible").attr("fill-opacity", 0.25).attr("stroke-width", 1);
+                lensAddG.select(".add-btn-text").attr("opacity", 0.6);
+              });
+              const capPairKey = pairKey;
+              lensAddG.on("click", (event) => {
+                event.stopPropagation();
+                const newConcept = "新概念";
+                const newRelations = data.relations.map((r) => {
+                  const rKey = [...r.sets].sort().join("|");
+                  if (rKey === capPairKey) {
+                    return { ...r, sharedConcepts: [...r.sharedConcepts, newConcept] };
+                  }
+                  return r;
+                });
+                onDataChange({ ...data, relations: newRelations });
+              });
+            }
           }
 
           const highlight = lensG.append("path").attr("d", path)
@@ -910,18 +1283,23 @@ export default function VennDiagram({ data }: Props) {
 
           lensG.on("click", (event) => {
             event.stopPropagation();
-            const isVisible = tooltipEl.style("display") === "block" && tooltipEl.attr("data-pair") === pairKey;
-            if (isVisible) {
-              tooltipEl.style("display", "none").attr("data-pair", "");
-              highlight.attr("fill", "hsla(0,0%,100%,0)").attr("stroke", "hsla(0,0%,100%,0)");
-            } else {
-              highlight.attr("fill", "hsla(0,0%,100%,0.12)").attr("stroke", "hsla(0,0%,100%,0.4)");
-              tooltipEl.style("display", "block").attr("data-pair", pairKey)
-                .style("left", event.pageX+14+"px").style("top", event.pageY-10+"px")
-                .style("border-color", mixedTextColor)
-                .html(`<div style="color:${mixedTextColor};font-weight:700;margin-bottom:4px;font-size:11px">${p1.node.label} ∩ ${p2.node.label}</div>`
-                  + concepts.map(c => `<div style="color:${mixedTextColor};padding:2px 0">${c}</div>`).join(""));
-            }
+            tooltipEl.style("display", "none").attr("data-pair", "");
+            // Use selection panel instead of tooltip
+            const intersectionNode: VennNode = {
+              id: pairKey,
+              label: rel!.label || `${p1.node.label} ∩ ${p2.node.label}`,
+              description: concepts.join("、"),
+              children: concepts.map((c, ci) => ({ id: `${pairKey}_${ci}`, label: c, children: [] })),
+            };
+            setSelection({
+              node: intersectionNode,
+              colorIndex: p1.colorIndex,
+              relation: rel!,
+              nodeA: p1.node,
+              nodeB: p2.node,
+              colorIndexA: p1.colorIndex,
+              colorIndexB: p2.colorIndex,
+            });
           });
           lensG.on("mouseenter", () => {
             highlight.attr("fill", "hsla(0,0%,100%,0.08)").attr("stroke", "hsla(0,0%,100%,0.25)");
@@ -939,7 +1317,7 @@ export default function VennDiagram({ data }: Props) {
       }
     }
 
-    // ── Triple intersections (3-circle overlap) ──
+    // ── Triple intersections (3-circle overlap, rendered on top of 2-circle lens fills) ──
     for (let a = 0; a < topPositions.length; a++) {
       for (let b = a + 1; b < topPositions.length; b++) {
         for (let c = b + 1; c < topPositions.length; c++) {
@@ -949,36 +1327,24 @@ export default function VennDiagram({ data }: Props) {
           const pathBC = lensPath(pb.x, pb.y, pb.r, pc.x, pc.y, pc.r);
           if (!pathAB || !pathAC || !pathBC) continue;
 
-          // Draw AB lens clipped to circle C = A∩B∩C
           const tripleId = `triple-${a}-${b}-${c}`;
           const clipC = defs.append("clipPath").attr("id", tripleId);
           clipC.append("circle").attr("cx", pc.x).attr("cy", pc.y).attr("r", pc.r);
 
-          // Blend three colors
-          const [h1, s1, l1] = HSL_VALUES[pa.colorIndex % HSL_VALUES.length];
-          const [h2, s2, l2] = HSL_VALUES[pb.colorIndex % HSL_VALUES.length];
-          const [h3, s3, l3] = HSL_VALUES[pc.colorIndex % HSL_VALUES.length];
-          let hSum = 0;
-          [h1, h2, h3].forEach((h, i) => {
-            let diff = h - h1;
-            if (diff > 180) diff -= 360;
-            if (diff < -180) diff += 360;
-            hSum += h1 + diff;
-          });
-          let hAvg = hSum / 3;
-          if (hAvg < 0) hAvg += 360;
-          if (hAvg >= 360) hAvg -= 360;
-          const tripleFill = `hsl(${Math.round(hAvg)}, ${Math.round((s1+s2+s3)/3)}%, ${Math.round((l1+l2+l3)/3 + 8)}%)`;
+          const tripleFill = "hsl(40, 25%, 32%)";
 
           lensLayer.append("path")
             .attr("d", pathAB)
             .attr("clip-path", `url(#${tripleId})`)
             .attr("fill", tripleFill)
-            .attr("stroke", "hsla(0,0%,100%,0.3)")
-            .attr("stroke-width", 1);
+            .attr("stroke", "hsla(0,0%,100%,0.4)")
+            .attr("stroke-width", 1.5);
         }
       }
     }
+
+    // Move concept circles above triple intersection
+    lensConceptOverlay.raise();
 
     // ── Visibility ──
     function updateVisibility() {
@@ -1035,8 +1401,8 @@ export default function VennDiagram({ data }: Props) {
     }
 
     function zoomToCircle(tx: number, ty: number, tr: number, showChildren: boolean) {
-      const minScale = showChildren ? CHILD_SHOW_SCALE+1.5 : 1;
-      const fitScale = Math.min(15, Math.min(width, height)/(tr*2*1.2));
+      const minScale = showChildren ? CHILD_SHOW_SCALE + 0.5 : 1;
+      const fitScale = Math.min(15, Math.min(width, height) / (tr * 2 * 1.3));
       const targetScale = Math.max(minScale, fitScale);
       svg.transition().duration(750).ease(d3.easeCubicInOut)
         .call(zoom.transform, d3.zoomIdentity.translate(width/2-tx*targetScale, height/2-ty*targetScale).scale(targetScale));
@@ -1079,8 +1445,15 @@ export default function VennDiagram({ data }: Props) {
         .call(zoom.transform, d3.zoomIdentity.translate(width*(1-s)/2, height*(1-s)/2).scale(s));
     });
 
-    const s = 0.85;
-    svg.call(zoom.transform, d3.zoomIdentity.translate(width*(1-s)/2, height*(1-s)/2).scale(s));
+    if (savedTransformRef.current) {
+      // Restore previous zoom position (e.g. after adding a child node)
+      svg.call(zoom.transform, savedTransformRef.current);
+      currentScale = savedTransformRef.current.k;
+      updateVisibility();
+    } else {
+      const s = 0.85;
+      svg.call(zoom.transform, d3.zoomIdentity.translate(width*(1-s)/2, height*(1-s)/2).scale(s));
+    }
   }, [data, showBorders]);
 
   useEffect(() => {
@@ -1102,7 +1475,7 @@ export default function VennDiagram({ data }: Props) {
         </button>
         <button onClick={() => setShowBorders(true)}
           className={`px-3 py-1.5 text-xs rounded-md transition-colors ${showBorders ? "bg-gray-700 text-white" : "text-gray-400 hover:text-gray-200"}`}>
-          边框
+          透视
         </button>
       </div>
 
@@ -1110,23 +1483,94 @@ export default function VennDiagram({ data }: Props) {
       {selection && (
         <div className="absolute top-4 left-4 z-10 w-72 bg-gray-900/95 backdrop-blur border rounded-xl overflow-hidden"
           style={{ borderColor: selColor + "60" }}>
-          {/* Header */}
+          {/* Header with label editing */}
           <div className="px-4 pt-3 pb-2 border-b" style={{ borderColor: selColor + "30" }}>
-            {selection.parentNode ? (
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="text-xs text-gray-500">
+                {selection.relation ? "交叉领域" : selection.parentNode ? "子概念" : "概念层级"}
+              </div>
+              <div className="flex items-center gap-1">
+                {onOpenWiki && !selection.relation && (
+                  <button
+                    onClick={() => onOpenWiki(selection.node.id)}
+                    className="text-xs px-1.5 py-0.5 rounded text-gray-500 hover:text-blue-400 hover:bg-blue-400/10 transition-colors"
+                    title="在 Wiki 中查看"
+                  >Wiki</button>
+                )}
+                {onDataChange && !selection.relation && selection.node.children && selection.node.children.length > 0 && (
+                  <button
+                    onClick={() => {
+                      const newNodes = updateNodeInTree(data.nodes, selection.node.id, (node) => ({
+                        ...node,
+                        collapsed: !node.collapsed,
+                      }));
+                      onDataChange({ ...data, nodes: newNodes });
+                      setSelection({ ...selection, node: { ...selection.node, collapsed: !selection.node.collapsed } });
+                    }}
+                    className="text-xs px-1.5 py-0.5 rounded text-gray-500 hover:text-purple-400 hover:bg-purple-400/10 transition-colors"
+                    title={selection.node.collapsed ? "展开子级" : "折叠子级"}
+                  >{selection.node.collapsed ? "展开" : "折叠"}</button>
+                )}
+                {onDataChange && selection.parentNode && !selection.relation && (
+                  <button
+                    onClick={handleDeleteNode}
+                    className="text-xs px-1.5 py-0.5 rounded text-gray-500 hover:text-red-400 hover:bg-red-400/10 transition-colors"
+                    title="删除"
+                  >删除</button>
+                )}
+              </div>
+            </div>
+            {selection.relation && selection.nodeA && selection.nodeB ? (
               <>
-                <div className="text-xs text-gray-500 mb-1.5">子概念</div>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <span className="text-xs text-gray-500">{selection.parentNode.label}</span>
-                  <span className="text-gray-600 text-xs">→</span>
-                  <span className="text-sm font-bold" style={{ color: selColor }}>{selection.node.label}</span>
+                <div className="flex items-center gap-1.5 mb-1">
+                  <span className="text-xs" style={{ color: CSS_COLORS[selection.colorIndexA! % CSS_COLORS.length] }}>{selection.nodeA.label}</span>
+                  <span className="text-gray-600 text-xs">∩</span>
+                  <span className="text-xs" style={{ color: CSS_COLORS[selection.colorIndexB! % CSS_COLORS.length] }}>{selection.nodeB.label}</span>
                 </div>
+                <div className="text-sm font-bold" style={{ color: selColor }}>{selection.node.label}</div>
+                {selection.relation.sharedConcepts.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 items-center mt-1.5">
+                    {selection.relation.sharedConcepts.map((c, ci) => (
+                      <span key={ci} className="text-xs px-1.5 py-0.5 rounded" style={{ color: selColor, background: selColor + "15" }}>
+                        {c}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </>
             ) : (
               <>
-                <div className="text-xs text-gray-500 mb-1.5">概念层级</div>
-                {selection.node.children && selection.node.children.length > 0 ? (
-                  <div className="flex flex-wrap gap-1.5 items-center">
+                {selection.parentNode && (
+                  <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                    <span className="text-xs text-gray-500">{selection.parentNode.label}</span>
+                    <span className="text-gray-600 text-xs">→</span>
+                  </div>
+                )}
+                {editingField === "label" ? (
+                  <div className="flex items-center gap-1">
+                    <input
+                      autoFocus
+                      value={editValue}
+                      onChange={(e) => setEditValue(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") handleEditSave(); if (e.key === "Escape") setEditingField(null); }}
+                      className="flex-1 text-sm font-bold bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-200 focus:outline-none focus:border-blue-500"
+                    />
+                    <button onClick={handleEditSave} className="text-xs text-blue-400 hover:text-blue-300">确定</button>
+                    <button onClick={() => setEditingField(null)} className="text-xs text-gray-500 hover:text-gray-300">取消</button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
                     <span className="text-sm font-bold" style={{ color: selColor }}>{selection.node.label}</span>
+                    {onDataChange && (
+                      <button
+                        onClick={() => { setEditingField("label"); setEditValue(selection.node.label); }}
+                        className="text-xs text-gray-600 hover:text-gray-400"
+                      >✎</button>
+                    )}
+                  </div>
+                )}
+                {!selection.parentNode && selection.node.children && selection.node.children.length > 0 && editingField !== "label" && (
+                  <div className="flex flex-wrap gap-1.5 items-center mt-1.5">
                     <span className="text-gray-600 text-xs">→</span>
                     {selection.node.children.map((child) => (
                       <span key={child.id} className="text-xs px-1.5 py-0.5 rounded" style={{ color: selColor, background: selColor + "15" }}>
@@ -1134,49 +1578,10 @@ export default function VennDiagram({ data }: Props) {
                       </span>
                     ))}
                   </div>
-                ) : (
-                  <span className="text-sm font-bold" style={{ color: selColor }}>{selection.node.label}</span>
                 )}
               </>
             )}
           </div>
-
-          {/* Description */}
-          {selection.node.description && (
-            <div className="px-4 py-2 border-b text-xs text-gray-400" style={{ borderColor: selColor + "20" }}>
-              {selection.node.description}
-            </div>
-          )}
-
-          {/* Related intersections for top-level nodes */}
-          {!selection.parentNode && data.relations.filter(r => r.sets.includes(selection.node.id)).length > 0 && (
-            <div className="px-4 py-2 border-b text-xs" style={{ borderColor: selColor + "20" }}>
-              <div className="text-gray-500 mb-1.5">交叉领域</div>
-              {data.relations.filter(r => r.sets.includes(selection.node.id)).map((rel, ri) => {
-                const otherId = rel.sets.find(s => s !== selection.node.id);
-                const otherNode = data.nodes.find(n => n.id === otherId);
-                const otherIdx = data.nodes.findIndex(n => n.id === otherId);
-                const otherColor = otherIdx >= 0 ? CSS_COLORS[otherIdx % CSS_COLORS.length] : "#888";
-                return (
-                  <div key={ri} className="mb-2 last:mb-0">
-                    <div className="flex items-center gap-1 mb-1">
-                      <span style={{ color: selColor }}>{selection.node.label}</span>
-                      <span className="text-gray-600">∩</span>
-                      <span style={{ color: otherColor }}>{otherNode?.label}</span>
-                      {rel.label && <span className="text-gray-500 ml-1">— {rel.label}</span>}
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      {rel.sharedConcepts.map((c, ci) => (
-                        <span key={ci} className="px-1.5 py-0.5 rounded text-gray-300" style={{ background: "hsla(0,0%,100%,0.08)" }}>
-                          {c}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
 
           {/* Sub-children list (if child has its own children) */}
           {selection.parentNode && selection.node.children && selection.node.children.length > 0 && (
@@ -1192,16 +1597,119 @@ export default function VennDiagram({ data }: Props) {
             </div>
           )}
 
-          {/* Editable notes */}
-          <div className="px-4 py-2">
+          {/* Notes (persisted in VennData) */}
+          <div className="px-4 py-2 border-b" style={{ borderColor: selColor + "20" }}>
             <div className="text-xs text-gray-500 mb-1.5">笔记</div>
             <textarea
-              value={notes[selection.node.id] || ""}
-              onChange={(e) => setNotes({ ...notes, [selection.node.id]: e.target.value })}
+              value={selection.node.notes ?? selection.node.description ?? ""}
+              onChange={(e) => {
+                if (!onDataChange) return;
+                const newNotes = e.target.value;
+                const newNodes = updateNodeInTree(data.nodes, selection.node.id, (node) => ({
+                  ...node,
+                  notes: newNotes,
+                }));
+                onDataChange({ ...data, nodes: newNodes });
+                setSelection({ ...selection, node: { ...selection.node, notes: newNotes } });
+              }}
               placeholder="在此添加笔记..."
               className="w-full h-24 bg-gray-800/50 border border-gray-700 rounded-lg p-2 text-xs text-gray-300 resize-none focus:outline-none focus:border-gray-500 placeholder:text-gray-600"
             />
           </div>
+
+          {/* Knowledge density indicator */}
+          {(() => {
+            const density = estimateNodeDensity(selection.node);
+            const level = densityLevel(density);
+            const barWidth = Math.min(100, Math.max(8, density / 2));
+            const barColor = level === "sparse" ? "#6b7280" : level === "moderate" ? "#eab308" : "#22c55e";
+            const levelLabel = level === "sparse" ? "稀疏" : level === "moderate" ? "适中" : "丰富";
+            return (
+              <div className="px-4 py-2 border-b" style={{ borderColor: selColor + "20" }}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs text-gray-500">知识密度</span>
+                  <span className="text-xs" style={{ color: barColor }}>{density} 字 · {levelLabel}</span>
+                </div>
+                <div className="w-full h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all duration-300" style={{ width: barWidth + "%", backgroundColor: barColor }} />
+                </div>
+                {level === "sparse" && (
+                  <div className="text-xs text-gray-600 mt-1">建议补充描述或添加子概念</div>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* Deep analyze — at bottom */}
+          {onDeepAnalyze && (
+            <div className="px-4 py-2 text-xs">
+              {deepInput === null ? (
+                <button
+                  onClick={() => setDeepInput("")}
+                  className="w-full py-1.5 rounded-md text-center transition-colors"
+                  style={{ color: selColor, background: selColor + "12" }}
+                >
+                  深入分析 — 为「{selection.node.label}」生成子概念
+                </button>
+              ) : (
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-gray-500">粘贴文本或上传文件</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => deepFileRef.current?.click()}
+                        className="text-gray-500 hover:text-gray-300 transition-colors"
+                      >上传</button>
+                      <button
+                        onClick={() => { setDeepInput(null); }}
+                        className="text-gray-500 hover:text-gray-300 transition-colors"
+                      >取消</button>
+                    </div>
+                    <input
+                      ref={deepFileRef}
+                      type="file"
+                      accept=".txt,.md,.docx"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        const name = file.name.toLowerCase();
+                        if (name.endsWith(".txt") || name.endsWith(".md")) {
+                          setDeepInput(await file.text());
+                        } else if (name.endsWith(".docx")) {
+                          try {
+                            const formData = new FormData();
+                            formData.append("file", file);
+                            const res = await fetch("/api/upload", { method: "POST", body: formData });
+                            if (res.ok) { const d = await res.json(); setDeepInput(d.text); }
+                          } catch { /* ignore */ }
+                        }
+                        e.target.value = "";
+                      }}
+                    />
+                  </div>
+                  <textarea
+                    value={deepInput}
+                    onChange={(e) => setDeepInput(e.target.value)}
+                    placeholder={`输入关于「${selection.node.label}」的详细内容...`}
+                    className="w-full h-20 bg-gray-800 border border-gray-600 rounded p-2 text-xs text-gray-300 resize-none focus:outline-none focus:border-blue-500 placeholder:text-gray-600"
+                  />
+                  <button
+                    onClick={async () => {
+                      if (!deepInput?.trim() || !selection) return;
+                      await onDeepAnalyze(selection.node.id, deepInput.trim());
+                      setDeepInput(null);
+                    }}
+                    disabled={deepAnalyzing || !deepInput?.trim()}
+                    className="mt-1.5 w-full py-1.5 rounded-md font-medium transition-colors disabled:opacity-40"
+                    style={{ background: selColor + "25", color: selColor }}
+                  >
+                    {deepAnalyzing ? "分析中..." : "生成子概念"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 

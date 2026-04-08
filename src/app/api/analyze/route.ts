@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { analyzeConcepts } from "@/lib/zhipu";
+import { analyzeConcepts, AnalyzeMode } from "@/lib/zhipu";
 
 export async function POST(request: NextRequest) {
   try {
-    const { text } = await request.json();
+    const { text, mode, maxLevels } = await request.json();
 
     if (!text || typeof text !== "string" || text.trim().length === 0) {
       return NextResponse.json(
@@ -19,7 +19,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const data = await analyzeConcepts(text.trim());
+    const analyzeMode: AnalyzeMode = mode === "collect" ? "collect" : "organize";
+    const levels = maxLevels === 2 ? 2 : 3;
+    const data = await analyzeConcepts(text.trim(), analyzeMode, levels);
     return NextResponse.json(data);
   } catch (error) {
     console.error("Analysis error:", error);
